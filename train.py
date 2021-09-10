@@ -10,6 +10,9 @@ Options:
     --resume=CKPT      Resume from checkpoint
     --config=CONFIG    Specify run config to use [default: config.yml]
 """
+import warnings
+warnings.filterwarnings("ignore")
+
 import sys, shutil, random, yaml, os
 from datetime import datetime
 from pathlib import Path
@@ -23,12 +26,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from DiceCofficient import BCEDiceCofficient, accuracy, CEDiceCofficient
+from DiceCofficient import BCEDiceCofficient, accuracy, CEDiceCofficient, oldCEDiceCofficient
 from torchvision import datasets
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from PIL import Image
-from einops import reduce
+#from einops import reduce
+import warnings
+warnings.filterwarnings("ignore")
 
 try:
     from apex.optimizers import FusedAdam as Adam
@@ -185,11 +190,12 @@ def full_forward(model, img, target, metrics):
 
     target = target[0]
     if config['loss_args']['type'] == 'CE':
-        seg_acc, edge_acc = CEDiceCofficient(target=target, y_hat=y_hat)
+        seg_acc, edge_acc, dice_tp_seg, dice_div_seg = oldCEDiceCofficient(target=1*target, y_hat=1*y_hat)
+        #seg_acc2, edge_acc2 = CEDiceCofficient(target=target, y_hat=y_hat)
     else:
         seg_acc, edge_acc = BCEDiceCofficient(target=target, y_hat=y_hat)
 
-    metrics.step(Loss=loss, SegAcc=seg_acc, EdgeAcc=edge_acc)
+    metrics.step(Loss=loss, SegAcc=seg_acc, EdgeAcc=edge_acc)#, SegAcc2=seg_acc2)
 
     return dict(
         img=img,
@@ -210,6 +216,7 @@ def norm_0_1(x0):
 def train(dataset):
     global epoch
     # Training step
+    metrics.reset()
 
     data_loader = DataLoader(dataset,
         batch_size=config['batch_size'],
@@ -226,27 +233,11 @@ def train(dataset):
             param.grad = None
         res = full_forward(model, img, target, metrics)
 
-        # creating visualization of results
-        if config['loss_args']['type'] == 'CE':
-            if i == 1:
-                targets = torch.cat([norm_0_1(res['target'][0, i, ::]) for i in range(res['target'].shape[1])],1).detach().cpu()
-                y_hats = torch.cat([norm_0_1(res['y_hat'][0, i, ::]) for i in range(1 , (res['target'].shape[1]) * 2, 2)],1).detach().cpu()
-                y_hats_p = torch.cat([(res['y_hat'][0, i, ::] > 0) for i in range(1, (res['target'].shape[1]) * 2, 2)],1).detach().type(torch.FloatTensor).cpu()
-                all = torch.cat([targets,y_hats, y_hats_p], 0)
-                imagesc(all, show=False, save='sample_visualization.png')
-        else:
-            if i == 1:
-                targets = torch.cat([norm_0_1(res['target'][0, i, ::]) for i in range(res['target'].shape[1])], 1).detach().cpu()
-                y_hats = torch.cat([norm_0_1(res['y_hat'][0, i, ::]) for i in range(res['target'].shape[1])], 1).detach().cpu()
-                y_hats_p = torch.cat([(res['y_hat'][0, i, ::] > 0) for i in range(res['target'].shape[1])], 1).detach().type(torch.FloatTensor).cpu()
-                all = torch.cat([targets, y_hats, y_hats_p], 0)
-                imagesc(all, show=False, save='sample_visualization.png')
-
         res['loss'].backward()
         opt.step()
 
-        if (i+1) % 1000 == 0:
-            prog.set_postfix(metrics.peek())
+        #if (i+1) % 1000 == 0:
+        #    prog.set_postfix(metrics.peek())
 
     metrics_vals = metrics.evaluate()
     logstr = f'Epoch {epoch:02d} - Train: ' \
@@ -262,6 +253,7 @@ def train(dataset):
 @torch.no_grad()
 def val(dataset):
     # Validation step
+    metrics.reset()
     data_loader = DataLoader(dataset,
         batch_size=config['batch_size'],
         shuffle=False, num_workers=config['data_threads'],
@@ -271,16 +263,48 @@ def val(dataset):
     model.train(False)
 
     idx = 0
-    for img, target in tqdm(data_loader):
-        B = img.shape[0]
+
+    dicetp = 0
+    dicediv = 0
+
+    qq = 0
+    pp = 0
+
+    for i, (img, target) in enumerate(data_loader):
         res = full_forward(model, img, target, metrics)
 
-        if 0:  # SHOWING EXAMPLES HAVE PROBLEMS
-            for i in range(B):
-                if idx+i in config['visualization_tiles']:
-                    showexample(idx+i, img[i], res['target'][i], res['y_hat'][i])
-            idx += B
+        seg_acc, seg_acc, dice_tp_seg, dice_div_seg = oldCEDiceCofficient(target=res['target'][:, :1, ::],
+                                                                          y_hat=res['y_hat'][:, :2, ::])
+        dicetp = dicetp + dice_tp_seg
+        dicediv = dicediv + dice_div_seg
 
+        B = res['target'].shape[0]
+        targets = torch.cat([norm_0_1(res['target'][i, 0, ::]) for i in range(B)], 1).detach().cpu()
+        y_hats = torch.cat([norm_0_1(res['y_hat'][i, 1, ::]) for i in range(B)], 1).detach().cpu()
+        y_hats_p = torch.cat([torch.argmax(res['y_hat'][i, :2, ::], 0) for i in range(B)], 1).detach().cpu()
+
+        qq = qq + ((targets == 1) & (y_hats_p == 1)).sum()
+        pp = pp + (targets == 1).sum() + (y_hats_p == 1).sum()
+
+        # creating visualization of results
+        if config['loss_args']['type'] == 'CE':
+            if i == 1:
+                all = torch.cat([targets, y_hats, y_hats_p], 0)
+                imagesc(all, show=False, save='sample_visualization.png')
+        else:
+            if i == 1:
+                targets = torch.cat([norm_0_1(res['target'][0, i, ::]) for i in range(res['target'].shape[1])], 1).detach().cpu()
+                y_hats = torch.cat([norm_0_1(res['y_hat'][0, i, ::]) for i in range(res['target'].shape[1])], 1).detach().cpu()
+                y_hats_p = torch.cat([(res['y_hat'][0, i, ::] > 0) for i in range(res['target'].shape[1])], 1).detach().type(torch.FloatTensor).cpu()
+                all = torch.cat([targets, y_hats, y_hats_p], 0)
+                imagesc(all, show=False, save='sample_visualization.png')
+
+    # calculate manually oldCEDiceCofficient here
+    print(2*qq / pp)
+    # calculate by oldCEDiceCofficient here
+    print(dicetp * 2 / dicediv)
+
+    # calcuate by oldCEDiceCofficient using metrics
     metrics_vals = metrics.evaluate()
     logstr = f'Epoch {epoch:02d} - Val: ' \
            + ', '.join(f'{key}: {val:.3f}' for key, val in metrics_vals.items())
@@ -363,7 +387,7 @@ if __name__ == "__main__":
 
         args_d = {'mask_name': 'bone_resize_B_crop_00',
                   'data_path': os.getenv("HOME") + '/Dataset/OAI_DESS_segmentation/',
-                  'mask_used': [['femur', 'tibia']], # [[1, 2, 3]],[['femur', 'tibia'], [1], [2, 3]],  # ,
+                  'mask_used': [[1]], # [[1, 2, 3]],[['femur', 'tibia'], [1], [2, 3]],  # ,
                   'scale': 0.5,
                   'interval': 4,
                   'thickness': 0,

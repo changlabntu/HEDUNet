@@ -20,14 +20,12 @@ class Metrics():
                 self.running_agg[term] += additional_terms[term].detach()
                 self.running_count[term] += 1
 
-
     @torch.no_grad()
     def peek(self):
         values = {}
         for key in self.running_agg:
             values[key] = float(self.running_agg[key] / self.running_count[key])
         return values
-
 
     @torch.no_grad()
     def evaluate(self):
